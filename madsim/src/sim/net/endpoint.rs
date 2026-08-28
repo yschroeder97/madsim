@@ -408,6 +408,72 @@ mod tests {
     }
 
     #[test]
+    fn per_link_config() {
+        let runtime = Runtime::new();
+        let addr1 = "10.0.0.1:1".parse::<SocketAddr>().unwrap();
+        let addr2 = "10.0.0.2:1".parse::<SocketAddr>().unwrap();
+        let addr3 = "10.0.0.3:1".parse::<SocketAddr>().unwrap();
+        let node1 = runtime.create_node().ip(addr1.ip()).build();
+        let node2 = runtime.create_node().ip(addr2.ip()).build();
+        let node3 = runtime.create_node().ip(addr3.ip()).build();
+
+        let (id1, id2, id3) = (node1.id(), node2.id(), node3.id());
+        runtime.block_on(async move {
+            let net = simulator::<NetSim>();
+            // the link to node2 is slow, the link to node3 loses everything
+            net.set_link_config(
+                id1,
+                id2,
+                Config {
+                    packet_loss_rate: 0.0,
+                    send_latency: Duration::from_secs(5)..Duration::from_millis(5001),
+                },
+            );
+            net.set_link_config(
+                id1,
+                id3,
+                Config {
+                    packet_loss_rate: 1.0,
+                    send_latency: Duration::from_millis(1)..Duration::from_millis(10),
+                },
+            );
+        });
+
+        let barrier = Arc::new(Barrier::new(3));
+        let barrier1 = barrier.clone();
+        let barrier2 = barrier.clone();
+
+        node1.spawn(async move {
+            let net = Endpoint::bind(addr1).await.unwrap();
+            barrier1.wait().await;
+            net.send_to(addr2, 1, &[1]).await.unwrap();
+            net.send_to(addr3, 1, &[1]).await.unwrap();
+        });
+
+        let slow = node2.spawn(async move {
+            let net = Endpoint::bind(addr2).await.unwrap();
+            barrier2.wait().await;
+            let t0 = Instant::now();
+            let mut buf = vec![0; 0x10];
+            net.recv_from(1, &mut buf).await.unwrap();
+            assert!(t0.elapsed() >= Duration::from_secs(5));
+        });
+
+        let lossy = node3.spawn(async move {
+            let net = Endpoint::bind(addr3).await.unwrap();
+            barrier.wait().await;
+            let mut buf = vec![0; 0x10];
+            timeout(Duration::from_secs(60), net.recv_from(1, &mut buf))
+                .await
+                .err()
+                .unwrap();
+        });
+
+        runtime.block_on(slow).unwrap();
+        runtime.block_on(lossy).unwrap();
+    }
+
+    #[test]
     fn receiver_drop() {
         let runtime = Runtime::new();
         let addr1 = "10.0.0.1:1".parse::<SocketAddr>().unwrap();

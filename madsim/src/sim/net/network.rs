@@ -27,6 +27,7 @@ pub(crate) struct Network {
     clogged_node_in: HashSet<NodeId>,
     clogged_node_out: HashSet<NodeId>,
     clogged_link: HashSet<(NodeId, NodeId)>,
+    link_config: HashMap<(NodeId, NodeId), Config>,
 }
 
 /// A node in the network.
@@ -123,6 +124,7 @@ impl Network {
             clogged_node_in: HashSet::new(),
             clogged_node_out: HashSet::new(),
             clogged_link: HashSet::new(),
+            link_config: HashMap::new(),
         }
     }
 
@@ -195,6 +197,20 @@ impl Network {
         self.clogged_link.remove(&(src, dst));
     }
 
+    /// Set a dedicated config for the link from `src` to `dst`, overriding the global one.
+    pub fn set_link_config(&mut self, src: NodeId, dst: NodeId, config: Config) {
+        assert!(self.nodes.contains_key(&src), "node not found");
+        assert!(self.nodes.contains_key(&dst), "node not found");
+        debug!(?src, ?dst, ?config, "set_link_config");
+        self.link_config.insert((src, dst), config);
+    }
+
+    /// Remove the dedicated config of the link from `src` to `dst`, restoring the global one.
+    pub fn unset_link_config(&mut self, src: NodeId, dst: NodeId) {
+        debug!(?src, ?dst, "unset_link_config");
+        self.link_config.remove(&(src, dst));
+    }
+
     /// Returns whether the link from `src` to `dst` is clogged.
     pub fn link_clogged(&self, src: NodeId, dst: NodeId) -> bool {
         self.clogged_node_out.contains(&src)
@@ -259,12 +275,17 @@ impl Network {
 
     /// Returns the latency of sending a packet. If packet loss, returns `None`.
     fn test_link(&mut self, src: NodeId, dst: NodeId) -> Option<Duration> {
-        if self.link_clogged(src, dst) || self.rand.gen_bool(self.config.packet_loss_rate) {
+        let config = self
+            .link_config
+            .get(&(src, dst))
+            .unwrap_or(&self.config)
+            .clone();
+        if self.link_clogged(src, dst) || self.rand.gen_bool(config.packet_loss_rate) {
             None
         } else {
             self.stat.msg_count += 1;
             // TODO: special value for loopback
-            Some(self.rand.gen_range(self.config.send_latency.clone()))
+            Some(self.rand.gen_range(config.send_latency))
         }
     }
 

@@ -222,6 +222,16 @@ impl NetSim {
         self.network.lock().clog_link(src, dst);
     }
 
+    /// Set a dedicated config for the link from `src` to `dst`, overriding the global one.
+    pub fn set_link_config(&self, src: NodeId, dst: NodeId, config: Config) {
+        self.network.lock().set_link_config(src, dst, config);
+    }
+
+    /// Remove the dedicated config of the link from `src` to `dst`, restoring the global one.
+    pub fn unset_link_config(&self, src: NodeId, dst: NodeId) {
+        self.network.lock().unset_link_config(src, dst);
+    }
+
     /// Add a DNS record for the cluster.
     pub fn add_dns_record(&self, hostname: &str, ip: IpAddr) {
         self.dns.lock().add(hostname, ip);
