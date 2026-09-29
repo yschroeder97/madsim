@@ -61,6 +61,7 @@ mod addr;
 mod dns;
 mod endpoint;
 pub mod ipvs;
+pub mod link;
 mod network;
 #[cfg(feature = "rpc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "rpc")))]
@@ -72,6 +73,7 @@ pub mod unix;
 pub use self::addr::{lookup_host, ToSocketAddrs};
 use self::dns::DnsServer;
 pub use self::endpoint::{Endpoint, Receiver, Sender};
+pub use self::link::LinkModel;
 use self::ipvs::{IpVirtualServer, ServiceAddr};
 pub use self::network::{Config, Stat};
 use self::network::{Direction, IpProtocol, Network, Socket};
@@ -227,6 +229,22 @@ impl NetSim {
         self.network.lock().set_link_config(src, dst, config);
     }
 
+    /// Install a [`LinkModel`] for the link from `src` to `dst`; it decides delay and loss of
+    /// every packet and takes precedence over link and global configs. Returns the model it replaces.
+    pub fn set_link_model(
+        &self,
+        src: NodeId,
+        dst: NodeId,
+        model: impl LinkModel,
+    ) -> Option<Box<dyn LinkModel>> {
+        self.network.lock().set_link_model(src, dst, Box::new(model))
+    }
+
+    /// Remove the model of the link from `src` to `dst`, restoring the config-driven behaviour.
+    pub fn unset_link_model(&self, src: NodeId, dst: NodeId) -> Option<Box<dyn LinkModel>> {
+        self.network.lock().unset_link_model(src, dst)
+    }
+
     /// Remove the dedicated config of the link from `src` to `dst`, restoring the global one.
     pub fn unset_link_config(&self, src: NodeId, dst: NodeId) {
         self.network.lock().unset_link_config(src, dst);
@@ -325,8 +343,9 @@ impl NetSim {
         {
             dst = addr.parse().expect("invalid socket address");
         }
+        let now = self.time.elapsed();
         if let Some((ip, dst_node, socket, latency)) =
-            self.network.lock().try_send(node, dst, protocol)
+            self.network.lock().try_send(node, dst, protocol, now)
         {
             trace!(?latency, "delay");
             let hook = self.hooks_rsp.lock().get(&dst_node).cloned();
@@ -358,7 +377,8 @@ impl NetSim {
         {
             dst = addr.parse().expect("invalid socket address");
         }
-        let (ip, dst_node, socket, latency) = (self.network.lock().try_send(node, dst, protocol))
+        let now = self.time.elapsed();
+        let (ip, dst_node, socket, latency) = (self.network.lock().try_send(node, dst, protocol, now))
             .ok_or_else(|| {
             io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused")
         })?;
@@ -383,9 +403,10 @@ impl NetSim {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let net = self.clone();
         let test_link = Arc::new(move || {
+            let now = net.time.elapsed();
             net.network
                 .lock()
-                .try_send(node, dst, protocol)
+                .try_send(node, dst, protocol, now)
                 .map(|(_, _, _, latency)| net.time.now_instant() + latency)
         });
         let sender = PayloadSender {

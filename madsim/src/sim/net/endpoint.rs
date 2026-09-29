@@ -366,6 +366,7 @@ impl Mailbox {
 mod tests {
     use super::*;
     use crate::{plugin::simulator, runtime::Runtime, time::*};
+    use rand::RngCore;
     use tokio::sync::Barrier;
 
     #[test]
@@ -405,6 +406,111 @@ mod tests {
         });
 
         runtime.block_on(f).unwrap();
+    }
+
+    #[test]
+    fn link_model_precedes_config_and_tracks_time() {
+        use std::sync::Mutex as StdMutex;
+        let runtime = Runtime::new();
+        let addr1 = "10.0.0.1:1".parse::<SocketAddr>().unwrap();
+        let addr2 = "10.0.0.2:1".parse::<SocketAddr>().unwrap();
+        let node1 = runtime.create_node().ip(addr1.ip()).build();
+        let node2 = runtime.create_node().ip(addr2.ip()).build();
+        let (id1, id2) = (node1.id(), node2.id());
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        runtime.block_on(async move {
+            let net = simulator::<NetSim>();
+            net.set_link_config(
+                id1,
+                id2,
+                Config {
+                    packet_loss_rate: 1.0,
+                    send_latency: Duration::from_secs(9)..Duration::from_secs(10),
+                },
+            );
+            let mut count = 0u32;
+            let old = net.set_link_model(id1, id2, move |now: Duration, _: &mut dyn RngCore| {
+                seen2.lock().unwrap().push(now);
+                count += 1;
+                (count % 2 == 1).then(|| Duration::from_millis(100 * count as u64))
+            });
+            assert!(old.is_none());
+        });
+
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier1 = barrier.clone();
+        node1.spawn(async move {
+            let net = Endpoint::bind(addr1).await.unwrap();
+            barrier1.wait().await;
+            for _ in 0..4 {
+                net.send_to(addr2, 1, &[1]).await.unwrap();
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
+        let recv = node2.spawn(async move {
+            let net = Endpoint::bind(addr2).await.unwrap();
+            barrier.wait().await;
+            let mut buf = vec![0; 0x10];
+            let t0 = Instant::now();
+            net.recv_from(1, &mut buf).await.unwrap();
+            let first = t0.elapsed();
+            assert!(first >= Duration::from_millis(100) && first < Duration::from_millis(200), "{first:?}");
+            net.recv_from(1, &mut buf).await.unwrap();
+            let third = t0.elapsed();
+            assert!(third >= Duration::from_millis(2300) && third < Duration::from_millis(2400), "{third:?}");
+            timeout(Duration::from_secs(30), net.recv_from(1, &mut buf))
+                .await
+                .err()
+                .unwrap();
+        });
+        runtime.block_on(recv).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]));
+        assert!(seen[1] - seen[0] >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn link_models_are_per_direction_and_swappable() {
+        let runtime = Runtime::new();
+        let addr1 = "10.0.0.1:1".parse::<SocketAddr>().unwrap();
+        let addr2 = "10.0.0.2:1".parse::<SocketAddr>().unwrap();
+        let node1 = runtime.create_node().ip(addr1.ip()).build();
+        let node2 = runtime.create_node().ip(addr2.ip()).build();
+        let (id1, id2) = (node1.id(), node2.id());
+        runtime.block_on(async move {
+            let net = simulator::<NetSim>();
+            net.set_link_model(id1, id2, |_: Duration, _: &mut dyn RngCore| None);
+            let old = net.set_link_model(id1, id2, |_: Duration, _: &mut dyn RngCore| {
+                Some(Duration::from_millis(50))
+            });
+            assert!(old.is_some());
+            net.clog_link(id2, id1);
+            assert!(net.unset_link_model(id2, id1).is_none());
+        });
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier1 = barrier.clone();
+        node1.spawn(async move {
+            let net = Endpoint::bind(addr1).await.unwrap();
+            barrier1.wait().await;
+            net.send_to(addr2, 1, &[1]).await.unwrap();
+            let mut buf = vec![0; 0x10];
+            timeout(Duration::from_secs(30), net.recv_from(1, &mut buf))
+                .await
+                .err()
+                .unwrap();
+        });
+        let recv = node2.spawn(async move {
+            let net = Endpoint::bind(addr2).await.unwrap();
+            barrier.wait().await;
+            let mut buf = vec![0; 0x10];
+            let t0 = Instant::now();
+            net.recv_from(1, &mut buf).await.unwrap();
+            assert!(t0.elapsed() >= Duration::from_millis(50));
+            net.send_to(addr1, 1, &[1]).await.unwrap();
+        });
+        runtime.block_on(recv).unwrap();
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use super::link::LinkModel;
 use super::{Payload, PayloadReceiver, PayloadSender};
 use crate::{rand::*, task::NodeId};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,7 @@ pub(crate) struct Network {
     clogged_node_out: HashSet<NodeId>,
     clogged_link: HashSet<(NodeId, NodeId)>,
     link_config: HashMap<(NodeId, NodeId), Config>,
+    link_model: HashMap<(NodeId, NodeId), Box<dyn LinkModel>>,
 }
 
 /// A node in the network.
@@ -125,6 +127,7 @@ impl Network {
             clogged_node_out: HashSet::new(),
             clogged_link: HashSet::new(),
             link_config: HashMap::new(),
+            link_model: HashMap::new(),
         }
     }
 
@@ -212,6 +215,27 @@ impl Network {
     }
 
     /// Returns whether the link from `src` to `dst` is clogged.
+    /// Install a model deciding delay and loss of every packet from `src` to `dst`.
+    /// It takes precedence over any link or global config; a clogged link still drops everything.
+    /// Returns the model it replaces.
+    pub fn set_link_model(
+        &mut self,
+        src: NodeId,
+        dst: NodeId,
+        model: Box<dyn LinkModel>,
+    ) -> Option<Box<dyn LinkModel>> {
+        assert!(self.nodes.contains_key(&src), "node not found");
+        assert!(self.nodes.contains_key(&dst), "node not found");
+        debug!(?src, ?dst, "set_link_model");
+        self.link_model.insert((src, dst), model)
+    }
+
+    /// Remove the model of the link from `src` to `dst`, restoring the config-driven behaviour.
+    pub fn unset_link_model(&mut self, src: NodeId, dst: NodeId) -> Option<Box<dyn LinkModel>> {
+        debug!(?src, ?dst, "unset_link_model");
+        self.link_model.remove(&(src, dst))
+    }
+
     pub fn link_clogged(&self, src: NodeId, dst: NodeId) -> bool {
         self.clogged_node_out.contains(&src)
             || self.clogged_node_in.contains(&dst)
@@ -274,13 +298,21 @@ impl Network {
     }
 
     /// Returns the latency of sending a packet. If packet loss, returns `None`.
-    fn test_link(&mut self, src: NodeId, dst: NodeId) -> Option<Duration> {
+    fn test_link(&mut self, src: NodeId, dst: NodeId, now: Duration) -> Option<Duration> {
+        if self.link_clogged(src, dst) {
+            return None;
+        }
+        if let Some(model) = self.link_model.get_mut(&(src, dst)) {
+            let latency = model.transit(now, &mut self.rand)?;
+            self.stat.msg_count += 1;
+            return Some(latency);
+        }
         let config = self
             .link_config
             .get(&(src, dst))
             .unwrap_or(&self.config)
             .clone();
-        if self.link_clogged(src, dst) || self.rand.gen_bool(config.packet_loss_rate) {
+        if self.rand.gen_bool(config.packet_loss_rate) {
             None
         } else {
             self.stat.msg_count += 1;
@@ -319,9 +351,10 @@ impl Network {
         node: NodeId,
         dst: SocketAddr,
         protocol: IpProtocol,
+        now: Duration,
     ) -> Option<(IpAddr, NodeId, Arc<dyn Socket>, Duration)> {
         let dst_node = self.resolve_dest_node(node, dst, protocol)?;
-        let latency = self.test_link(node, dst_node)?;
+        let latency = self.test_link(node, dst_node, now)?;
         let sockets = &self.nodes.get(&dst_node)?.sockets;
         let ep = (sockets.get(&(dst, protocol)))
             .or_else(|| sockets.get(&((Ipv4Addr::UNSPECIFIED, dst.port()).into(), protocol)))?;
