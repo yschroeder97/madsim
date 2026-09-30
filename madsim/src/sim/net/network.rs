@@ -298,12 +298,18 @@ impl Network {
     }
 
     /// Returns the latency of sending a packet. If packet loss, returns `None`.
-    fn test_link(&mut self, src: NodeId, dst: NodeId, now: Duration) -> Option<Duration> {
+    fn test_link(
+        &mut self,
+        src: NodeId,
+        dst: NodeId,
+        now: Duration,
+        len: usize,
+    ) -> Option<Duration> {
         if self.link_clogged(src, dst) {
             return None;
         }
         if let Some(model) = self.link_model.get_mut(&(src, dst)) {
-            let latency = model.transit(now, &mut self.rand)?;
+            let latency = model.transit(now, len, &mut self.rand)?;
             self.stat.msg_count += 1;
             return Some(latency);
         }
@@ -352,9 +358,10 @@ impl Network {
         dst: SocketAddr,
         protocol: IpProtocol,
         now: Duration,
+        len: usize,
     ) -> Option<(IpAddr, NodeId, Arc<dyn Socket>, Duration)> {
         let dst_node = self.resolve_dest_node(node, dst, protocol)?;
-        let latency = self.test_link(node, dst_node, now)?;
+        let latency = self.test_link(node, dst_node, now, len)?;
         let sockets = &self.nodes.get(&dst_node)?.sockets;
         let ep = (sockets.get(&(dst, protocol)))
             .or_else(|| sockets.get(&((Ipv4Addr::UNSPECIFIED, dst.port()).into(), protocol)))?;

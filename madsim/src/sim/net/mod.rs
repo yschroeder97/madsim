@@ -96,6 +96,35 @@ pub struct NetSim {
 /// Message sent to a network socket.
 pub type Payload = Box<dyn Any + Send + Sync>;
 
+/// Size in bytes of a payload whose type carries one: the data of `Endpoint::send_to`
+/// (`(tag, Vec<u8>)`) and of TCP writes (`Bytes`); `None` for opaque payloads such as raw
+/// messages and RPCs.
+fn payload_len(msg: &Payload) -> Option<usize> {
+    if let Some(v) = msg.downcast_ref::<Vec<u8>>() {
+        Some(v.len())
+    } else if let Some(b) = msg.downcast_ref::<Bytes>() {
+        Some(b.len())
+    } else if let Some((_, inner)) = msg.downcast_ref::<(u64, Payload)>() {
+        payload_len(inner)
+    } else {
+        None
+    }
+}
+
+/// Size in bytes of the IP packet carrying a payload to `dst`: payload, transport header
+/// (UDP 8, TCP 20 without options) and IP header (IPv4 20, IPv6 40). 0 for an opaque payload.
+fn packet_len(protocol: IpProtocol, dst: SocketAddr, payload: Option<usize>) -> usize {
+    let Some(payload) = payload else {
+        return 0;
+    };
+    let transport = match protocol {
+        IpProtocol::Udp => 8,
+        IpProtocol::Tcp => 20,
+    };
+    let ip = if dst.is_ipv4() { 20 } else { 40 };
+    payload + transport + ip
+}
+
 type MsgHookFn = Arc<dyn Fn(&Payload) -> bool + Send + Sync>;
 
 impl plugin::Simulator for NetSim {
@@ -344,8 +373,9 @@ impl NetSim {
             dst = addr.parse().expect("invalid socket address");
         }
         let now = self.time.elapsed();
+        let len = packet_len(protocol, dst, payload_len(&msg));
         if let Some((ip, dst_node, socket, latency)) =
-            self.network.lock().try_send(node, dst, protocol, now)
+            self.network.lock().try_send(node, dst, protocol, now, len)
         {
             trace!(?latency, "delay");
             let hook = self.hooks_rsp.lock().get(&dst_node).cloned();
@@ -378,7 +408,7 @@ impl NetSim {
             dst = addr.parse().expect("invalid socket address");
         }
         let now = self.time.elapsed();
-        let (ip, dst_node, socket, latency) = (self.network.lock().try_send(node, dst, protocol, now))
+        let (ip, dst_node, socket, latency) = (self.network.lock().try_send(node, dst, protocol, now, packet_len(protocol, dst, Some(0))))
             .ok_or_else(|| {
             io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused")
         })?;
@@ -402,11 +432,12 @@ impl NetSim {
     ) -> (PayloadSender, PayloadReceiver) {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let net = self.clone();
-        let test_link = Arc::new(move || {
+        let test_link = Arc::new(move |payload: Option<usize>| {
             let now = net.time.elapsed();
+            let len = packet_len(protocol, dst, payload);
             net.network
                 .lock()
-                .try_send(node, dst, protocol, now)
+                .try_send(node, dst, protocol, now, len)
                 .map(|(_, _, _, latency)| net.time.now_instant() + latency)
         });
         let sender = PayloadSender {
@@ -425,7 +456,7 @@ impl NetSim {
                     sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(10));
                     // retry
-                    state = test_link();
+                    state = test_link(payload_len(&value));
                 };
                 sleep_until(arrive_time).await;
                 yield value;
@@ -438,7 +469,7 @@ impl NetSim {
 
 #[doc(hidden)]
 pub struct PayloadSender {
-    test_link: Arc<dyn Fn() -> State + Send + Sync>,
+    test_link: Arc<dyn Fn(Option<usize>) -> State + Send + Sync>,
     tx: mpsc::UnboundedSender<(Payload, State)>,
 }
 
@@ -447,7 +478,7 @@ type State = Option<Instant>;
 
 impl PayloadSender {
     fn send(&self, value: Payload) -> Option<()> {
-        let state = (self.test_link)();
+        let state = (self.test_link)(payload_len(&value));
         self.tx.send((value, state)).ok()
     }
 
@@ -521,5 +552,25 @@ impl Drop for BindGuard {
         if let Some(mut network) = self.net.network.try_lock() {
             network.close(self.node.id, self.addr, self.protocol);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_len_adds_transport_and_ip_headers() {
+        let v4: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let v6: SocketAddr = "[::1]:1".parse().unwrap();
+        assert_eq!(packet_len(IpProtocol::Udp, v4, Some(17)), 45);
+        assert_eq!(packet_len(IpProtocol::Tcp, v4, Some(17)), 57);
+        assert_eq!(packet_len(IpProtocol::Udp, v6, Some(17)), 65);
+        assert_eq!(packet_len(IpProtocol::Tcp, v6, Some(0)), 60);
+        assert_eq!(packet_len(IpProtocol::Udp, v4, None), 0);
+        let raw: Payload = Box::new((7u64, Box::new(()) as Payload));
+        assert_eq!(payload_len(&raw), None);
+        let data: Payload = Box::new((7u64, Box::new(vec![0u8; 17]) as Payload));
+        assert_eq!(payload_len(&data), Some(17));
     }
 }

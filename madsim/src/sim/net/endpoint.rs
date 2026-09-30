@@ -430,8 +430,8 @@ mod tests {
                 },
             );
             let mut count = 0u32;
-            let old = net.set_link_model(id1, id2, move |now: Duration, _: &mut dyn RngCore| {
-                seen2.lock().unwrap().push(now);
+            let old = net.set_link_model(id1, id2, move |now: Duration, len: usize, _: &mut dyn RngCore| {
+                seen2.lock().unwrap().push((now, len));
                 count += 1;
                 (count % 2 == 1).then(|| Duration::from_millis(100 * count as u64))
             });
@@ -443,8 +443,8 @@ mod tests {
         node1.spawn(async move {
             let net = Endpoint::bind(addr1).await.unwrap();
             barrier1.wait().await;
-            for _ in 0..4 {
-                net.send_to(addr2, 1, &[1]).await.unwrap();
+            for i in 1..=4 {
+                net.send_to(addr2, 1, &vec![1; i]).await.unwrap();
                 sleep(Duration::from_secs(1)).await;
             }
         });
@@ -467,8 +467,10 @@ mod tests {
         runtime.block_on(recv).unwrap();
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 4);
-        assert!(seen.windows(2).all(|w| w[0] <= w[1]));
-        assert!(seen[1] - seen[0] >= Duration::from_secs(1));
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert!(seen[1].0 - seen[0].0 >= Duration::from_secs(1));
+        // UDP over IPv4: 8 + 20 header bytes on top of the payload.
+        assert_eq!(seen.iter().map(|&(_, len)| len).collect::<Vec<_>>(), [29, 30, 31, 32]);
     }
 
     #[test]
@@ -481,8 +483,8 @@ mod tests {
         let (id1, id2) = (node1.id(), node2.id());
         runtime.block_on(async move {
             let net = simulator::<NetSim>();
-            net.set_link_model(id1, id2, |_: Duration, _: &mut dyn RngCore| None);
-            let old = net.set_link_model(id1, id2, |_: Duration, _: &mut dyn RngCore| {
+            net.set_link_model(id1, id2, |_: Duration, _: usize, _: &mut dyn RngCore| None);
+            let old = net.set_link_model(id1, id2, |_: Duration, _: usize, _: &mut dyn RngCore| {
                 Some(Duration::from_millis(50))
             });
             assert!(old.is_some());

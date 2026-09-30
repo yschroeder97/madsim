@@ -101,6 +101,53 @@ mod tests {
     }
 
     #[test]
+    fn link_models_see_the_connect_and_the_written_bytes() {
+        use std::sync::Mutex;
+        let runtime = Runtime::new();
+        let addr1 = "10.0.0.1:1".parse::<SocketAddr>().unwrap();
+        let addr2 = "10.0.0.2:1".parse::<SocketAddr>().unwrap();
+        let node1 = runtime.create_node().ip(addr1.ip()).build();
+        let node2 = runtime.create_node().ip(addr2.ip()).build();
+        let (id1, id2) = (node1.id(), node2.id());
+        let lens = |from, to| {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let seen_ = seen.clone();
+            let model = move |_: Duration, len: usize, _: &mut dyn rand::RngCore| {
+                seen_.lock().unwrap().push(len);
+                Some(Duration::from_millis(1))
+            };
+            runtime.block_on(async move {
+                plugin::simulator::<NetSim>().set_link_model(from, to, model);
+            });
+            seen
+        };
+        let (down, up) = (lens(id1, id2), lens(id2, id1));
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_ = barrier.clone();
+
+        let f1 = node1.spawn(async move {
+            let listener = TcpListener::bind(addr1).await.unwrap();
+            barrier_.wait().await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"hello world").await.unwrap();
+            stream.flush().await.unwrap();
+            stream
+        });
+        let f2 = node2.spawn(async move {
+            barrier.wait().await;
+            let mut stream = TcpStream::connect(addr1).await.unwrap();
+            let mut buf = [0; 20];
+            stream.read(&mut buf).await.unwrap();
+        });
+
+        runtime.block_on(f1).unwrap();
+        runtime.block_on(f2).unwrap();
+        // TCP over IPv4: 20 + 20 header bytes; the connect is header-only.
+        assert_eq!(*down.lock().unwrap(), [51]);
+        assert_eq!(*up.lock().unwrap(), [40]);
+    }
+
+    #[test]
     fn disconnect_and_recovery() {
         let runtime = Runtime::new();
         let addr1 = "10.0.0.1:1".parse::<SocketAddr>().unwrap();
